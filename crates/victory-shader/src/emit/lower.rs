@@ -6618,6 +6618,111 @@ mod tests {
     }
 
     #[test]
+    fn image_sample_o_checks_signed_offsets_on_both_texture_axes() {
+        use super::super::container::SigElement;
+        use crate::{ResourceType, RootParam, RootType, UsedResource};
+
+        let compile = |packed| {
+            let words = [
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE8B_0380, // s_mov_b32 s11, 0
+                0xF40C_0004,
+                0xFA00_0000, // s_load_dwordx8 s[0:7], s[8:9], 0
+                0xF408_0305,
+                0xFA00_0000, // s_load_dwordx4 s[12:15], s[10:11], 0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0x7E00_02FF,
+                packed, // v_mov_b32 v0, packed
+                0x7E02_02F0,
+                0x7E04_02F0, // v_mov_b32 v1/v2, 0.5
+                0xF0C0_0F0A,
+                0x0060_0400,
+                0x0000_0201, // image_sample_o 2D
+                0xBF8C_3F70, // s_waitcnt vmcnt(0)
+                0xF800_180F,
+                0x0706_0504, // exp mrt0, v4-v7, done
+                S_ENDPGM,
+            ];
+            let table = |user_data, slot| RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data,
+                slot,
+            };
+            let binding = |kind, user_data, slot, dwords| UsedResource {
+                kind,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords,
+                user_data,
+                slot,
+            };
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![table(8, 0), table(10, 1)],
+                used: vec![
+                    binding(ResourceType::Srv, 8, 0, 8),
+                    binding(ResourceType::Sampler, 10, 1, 4),
+                ],
+                io: StageIo::Ps {
+                    inputs: vec![],
+                    input_addr: 0,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = ir::build(&native.code, false, 8).unwrap();
+            let res = resource::track(&p, &native.layout, native.stage)?;
+            let io = io::raise(&p, &native)?;
+            let st = structure::structure(&p)?;
+            lower(&Parts {
+                native: &native,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![SigElement {
+                    name: "SV_Target".into(),
+                    index: 0,
+                    kind: 16,
+                    comp: 9,
+                    interp: 0,
+                    row: Some(0),
+                    col: 0,
+                    cols: 4,
+                    usage: 0xf,
+                    half: false,
+                }],
+                prims: vec![],
+                mesh_stride: 0,
+            })
+        };
+        compile(0x0738).unwrap(); // x = -8, y = 7.
+        compile(0x3807).unwrap(); // x = 7, y = -8.
+        // A six-bit field encodes -9 as 0x37. Check each axis independently.
+        for packed in [0x0008, 0x0037, 0x0800, 0x3700] {
+            assert!(
+                matches!(
+                    compile(packed),
+                    Err(crate::ShaderError::Unsupported {
+                        what: "a sample offset past -8..7",
+                        ..
+                    })
+                ),
+                "accepted or misdiagnosed offset {packed:#06x}"
+            );
+        }
+    }
+
+    #[test]
     fn a_scalar_carry_chain_reaches_the_select() {
         // The high dword of a 64-bit add or subtract, then a select on the
         // carry (borrow) the high half leaves in SCC, and a branch on it

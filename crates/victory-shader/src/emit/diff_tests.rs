@@ -38,6 +38,8 @@ V vs(float4 p : POSITION, float2 uv : TEXCOORD0) {
 }
 "#;
 
+const SIGNED_OFFSETS: &str = "signed sample offsets";
+
 /// Pixel shaders, each `ps`.
 const CASES: &[(&str, &str)] = &[
     (
@@ -56,6 +58,15 @@ const CASES: &[(&str, &str)] = &[
             if (i.uv.x > 0.5) r.xy = sin(r.yx * 3.0);
             else r.z = rcp(r.z + 2.0);
             return r;
+        }"#,
+    ),
+    (
+        SIGNED_OFFSETS,
+        r#"[RootSignature(RS)] float4 ps(V i) : SV_Target {
+            float2 center = float2(0.5, 0.5);
+            return float4(tex.Sample(smp, center, int2(-8, 7)).z,
+                          tex.Sample(smp, center, int2(7, -8)).z,
+                          tex.Sample(smp, center).z, 1);
         }"#,
     ),
     // A wave-wide range scalarises a per-pixel loop (as the title's light
@@ -762,21 +773,31 @@ fn translated_shaders_draw_as_pc_ones() {
         3.0, -1.0, 0.5, 1.0, 2.0, 1.0,
     ];
     let textures: [(u32, u32, &[[f32; 4]]); 2] = [(1, 1, &dummy), (4, 4, &texels)];
-    let draw = |roots| Draw {
-        roots,
-        textures: &textures,
-        samplers: &samplers,
-        vertices: &vertices,
-        stride: 24,
-        size: (16, 16),
-        mesh_groups: 0,
-    };
+    // Odd dimensions place UV (0.5, 0.5) at the center of texel (16, 16).
+    // The single mip, point sampler and interior offsets fix each sample.
+    let offset_texels: Vec<[f32; 4]> = (0..33 * 33).map(|i| [0.0, 0.0, i as f32, 1.0]).collect();
+    let offset_textures = [(1, 1, &dummy[..]), (33, 33, &offset_texels[..])];
+    let offset_samplers = [samplers[0]; 2];
     let mut failures = Vec::new();
     let only = std::env::var("VICTORY_DIFF_ONLY").ok();
     for (name, src) in CASES
         .iter()
         .filter(|c| only.as_ref().is_none_or(|o| o == c.0))
     {
+        let (textures, samplers) = if *name == SIGNED_OFFSETS {
+            (&offset_textures, &offset_samplers)
+        } else {
+            (&textures, &samplers)
+        };
+        let draw = |roots| Draw {
+            roots,
+            textures,
+            samplers,
+            vertices: &vertices,
+            stride: 24,
+            size: (16, 16),
+            mesh_groups: 0,
+        };
         // A case may bring its own vertex shader.
         let vs = if src.contains(" vs16(") { "vs16" } else { "vs" };
         let vs_c = translate(&compile(&console, &dir, src, vs, "vs_6_5")).unwrap();
@@ -848,6 +869,13 @@ fn translated_shaders_draw_as_pc_ones() {
             )
             .unwrap();
 
+        if *name == SIGNED_OFFSETS {
+            let texel = |x, y| (y * 33 + x) as f32;
+            let expected = [texel(8, 23), texel(23, 8), texel(16, 16), 1.0];
+            for (backend, pixels) in [("translated", &ours), ("native", &theirs)] {
+                assert_eq!(pixels[8 * 16 + 8], expected, "{backend} sample offsets");
+            }
+        }
         let worst = ours
             .iter()
             .flatten()
