@@ -453,6 +453,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn conservative_depth_uses_centroid_position() {
+        // exp mrtz, v0, off, off, off, done; s_endpgm
+        let words = [0xF800_1881u32, 0, 0xBF81_0000];
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 10,  // POS_Z_FLOAT_ENA
+                db_shader_control: 1, // Z_EXPORT_ENABLE
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let position = SigElement {
+            name: "SV_Position".into(),
+            index: 0,
+            kind: 3,
+            comp: 9,
+            interp: 0,
+            row: Some(0),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        };
+        let input = container::signature(&[position], true);
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        for (name, kind, mode) in [
+            ("SV_DepthLessEqual", 18, 5),
+            ("SV_DepthGreaterEqual", 19, 5),
+            ("SV_Depth", 17, 4),
+        ] {
+            let output = container::signature(
+                &[SigElement {
+                    name: name.into(),
+                    index: 0,
+                    kind,
+                    comp: 9,
+                    interp: 0,
+                    row: None,
+                    col: 0,
+                    cols: 1,
+                    usage: 1,
+                    half: false,
+                }],
+                false,
+            );
+            let source = crate::dxbc::build(&[(FourCC::ISG1, &input), (FourCC::OSG1, &output)]);
+            let shader = emit(
+                &Container::parse(&source).unwrap(),
+                &native,
+                &p,
+                &st,
+                &io,
+                &res,
+            )
+            .unwrap();
+            let c = Container::parse(&shader.dxil).unwrap();
+            let psv = c.part(FourCC::PSV0).unwrap().data;
+            let word = |at| crate::dxbc::u32_at(psv, at).unwrap() as usize;
+            let resources = 4 + word(0);
+            assert_eq!(word(resources), 0);
+            let strings = resources + 4;
+            let indices = strings + 4 + word(strings);
+            let element_size = indices + 4 + word(indices) * 4;
+            assert_eq!(word(element_size), 16);
+            let position_row = element_size + 4;
+            assert_eq!(psv[position_row + 11], 3); // SV_Position
+            assert_eq!(psv[position_row + 13], mode, "{name}");
+        }
+    }
+
     /// A pixel shader writing a constant colour.
     fn constant_color() -> Vec<u8> {
         let mut s = Shader::new(true);
